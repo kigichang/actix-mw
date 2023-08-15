@@ -1,8 +1,9 @@
-#[cfg(feature="csrf")]
+#[cfg(feature = "csrf")]
 pub mod csrf;
 
 use std::{
-    future::{ready, Ready, Future},
+    future::{ready, Future, Ready},
+    marker::PhantomData,
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
@@ -13,102 +14,104 @@ use actix_web::{
     Error,
 };
 
+use futures_core::{future::LocalBoxFuture, ready};
 use futures_util::future::Either;
-use futures_core::{
-    future::LocalBoxFuture,
-    ready
-};
 use pin_project_lite::pin_project;
 
-pub trait Handler {
+pub trait Handler<B> {
     fn skip(&self, _: &ServiceRequest) -> bool {
-        return false;
+        false
     }
 
-    fn process(&self, req: ServiceRequest) -> Either<ServiceResponse, ServiceRequest>;
-    fn post(&self, resp: ServiceResponse) -> ServiceResponse {
-        return resp;
+    fn process(&self, req: ServiceRequest) -> Either<ServiceResponse<B>, ServiceRequest>;
+    fn post(&self, resp: ServiceResponse<B>) -> ServiceResponse<B> {
+        resp
     }
 }
 
-pub struct Factory<T>
+pub struct Factory<T, B>
 where
-    T: Handler
+    T: Handler<B>,
 {
     inner: Rc<T>,
-    //_body: PhantomData<B>,
+    _phantom: PhantomData<B>,
 }
 
-impl <T> Factory<T>
+impl<T, B> Factory<T, B>
 where
-    T: Handler
+    T: Handler<B>,
 {
     pub fn new(h: T) -> Self {
         Factory {
             inner: Rc::new(h),
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<S, T> Transform<S, ServiceRequest> for Factory<T>
+impl<S, T, B> Transform<S, ServiceRequest> for Factory<T, B>
 where
-    S: Service<ServiceRequest, Response = ServiceResponse, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     S::Future: 'static,
-    T: Handler,
+    T: Handler<B>,
+    B: 'static,
 {
-    type Response = ServiceResponse;
+    type Response = ServiceResponse<B>;
     type Error = Error;
     type InitError = ();
-    type Transform = Middleware<S, T>;
+    type Transform = Middleware<S, T, B>;
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
     fn new_transform(&self, service: S) -> Self::Future {
-        ready(Ok(Middleware { 
+        ready(Ok(Middleware {
             service,
             inner: self.inner.clone(),
+            _phantom: PhantomData,
         }))
     }
 }
 
-pub struct Middleware<S, T>
+pub struct Middleware<S, T, B>
 where
-    T: Handler,
+    T: Handler<B>,
 {
     service: S,
     inner: Rc<T>,
+    _phantom: PhantomData<B>,
 }
 
-impl<S, T> Service<ServiceRequest> for Middleware<S, T>
+impl<S, T, B> Service<ServiceRequest> for Middleware<S, T, B>
 where
-    S: Service<ServiceRequest, Response = ServiceResponse, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     S::Future: 'static,
-    T: Handler,
+    T: Handler<B>,
+    B: 'static,
 {
-    type Response = ServiceResponse;
+    type Response = ServiceResponse<B>;
     type Error = Error;
-    type Future = HandlerFuture<S::Future, T>;
+    type Future = HandlerFuture<S::Future, T, B>;
 
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         if self.inner.skip(&req) {
-            return HandlerFuture::SkipFuture { fut: self.service.call(req) };
+            return HandlerFuture::SkipFuture {
+                fut: self.service.call(req),
+            };
         }
 
         match self.inner.process(req) {
             Either::Left(res) => {
                 let h = self.inner.clone();
-                HandlerFuture::ErrorHandlerFuture { 
-                    fut: Box::pin(async move {
-                        Ok(res)
-                    }),
+                HandlerFuture::ErrorHandlerFuture {
+                    fut: Box::pin(async move { Ok(res) }),
                     inner: h,
                 }
-            },
+            }
             Either::Right(req) => {
                 let h = self.inner.clone();
 
-                HandlerFuture::HandlerFuture { 
+                HandlerFuture::HandlerFuture {
                     fut: self.service.call(req),
                     inner: h,
                 }
@@ -117,13 +120,12 @@ where
     }
 }
 
-
 pin_project! {
     #[project = HandlerProj]
-    pub enum HandlerFuture<Fut, T>
+    pub enum HandlerFuture<Fut, T, B>
     where
         Fut: Future,
-        T: Handler,
+        T: Handler<B>,
     {
         SkipFuture {
             #[pin]
@@ -136,70 +138,42 @@ pin_project! {
             inner: Rc<T>,
         },
         ErrorHandlerFuture {
-            fut: LocalBoxFuture<'static, Result<ServiceResponse, Error>>,
+            fut: LocalBoxFuture<'static, Result<ServiceResponse<B>, Error>>,
             inner: Rc<T>,
         },
     }
 }
 
-impl<Fut, T> Future for HandlerFuture<Fut, T>
+impl<Fut, T, B> Future for HandlerFuture<Fut, T, B>
 where
-    Fut: Future<Output = Result<ServiceResponse, Error>>,
-    T: Handler,
+    Fut: Future<Output = Result<ServiceResponse<B>, Error>>,
+    T: Handler<B>,
 {
-    type Output = Result<ServiceResponse, Error>;
+    type Output = Result<ServiceResponse<B>, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.as_mut().project() {
-            HandlerProj::SkipFuture {
-                fut,
-            } => {
-                Poll::Ready(Ok(ready!(fut.poll(cx))?))
-            },
-            HandlerProj::HandlerFuture {
-                fut,
-                inner,
-            } => {
+            HandlerProj::SkipFuture { fut } => Poll::Ready(Ok(ready!(fut.poll(cx))?)),
+            HandlerProj::HandlerFuture { fut, inner } => {
                 let res = ready!(fut.poll(cx))?;
                 let res = inner.post(res);
                 Poll::Ready(Ok(res))
             }
-            HandlerProj::ErrorHandlerFuture { 
-                fut,
-                inner,
-            } => {
+            HandlerProj::ErrorHandlerFuture { fut, inner } => {
                 let res = ready!(fut.as_mut().poll(cx))?;
                 let res = inner.post(res);
                 Poll::Ready(Ok(res))
-            },
+            }
         }
     }
 }
 
-
-pub(crate) fn match_uri(uri: &str, check: &str) -> bool {
-    if uri == check {
-        return true
+pub fn match_uri(test_uri: &str, check: &str) -> bool {
+    if test_uri == check {
+        return true;
     }
 
     let mut check_with_right_boundary = check.to_string();
     check_with_right_boundary.push('/');
-    return uri.starts_with(&check_with_right_boundary);
-}
-
-#[cfg(test)]
-mod tests {
-    use sha2::Digest;
-    #[test]
-    fn test_hash() {
-        let salt = "test".to_string();
-        let now = chrono::Utc::now().timestamp_millis();
-        let now = now.to_le_bytes();
-        let mut src = Vec::with_capacity(8 + salt.len());
-        src.extend_from_slice(&now);
-        src.extend_from_slice(&salt.as_bytes());
-
-        let hash = sha2::Sha256::digest(&src);
-        println!("{:?}", hex::encode(hash));
-    }
+    return test_uri.starts_with(&check_with_right_boundary);
 }

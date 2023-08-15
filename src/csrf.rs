@@ -1,22 +1,36 @@
 use std::str::FromStr;
-
 use crate::*;
 
 use actix_web::{
     http::header::{HeaderName, HeaderValue},
+    body::BoxBody,
     HttpResponse
 };
 
+#[derive(Clone, Debug)]
 pub struct CSRF {
     skip_urls: Vec<String>,
     salt: String,
-    effective: chrono::Duration,
-    header_name: HeaderName,
+    pub effective: chrono::Duration,
+    pub header_name: HeaderName,
 }
 
 use sha2::Digest;
 
 impl CSRF {
+    pub fn token(salt: &str) -> String {
+        let now = chrono::Utc::now().timestamp_millis().to_le_bytes();
+        let mut src = vec![0; 8+salt.len()];
+        src[0..8].copy_from_slice(&now);
+        src[8..].copy_from_slice(salt.as_bytes());
+        
+        let hash = sha2::Sha256::digest(&src);
+        let mut dst = vec![0; 8 + hash.len()];
+        dst[0..8].copy_from_slice(&now);
+        dst[8..].copy_from_slice(&hash);
+        hex::encode(dst)
+    }
+
     pub fn new(header_name: &str, skip_urls: Vec<String>, salt: &str, effective_duration: chrono::Duration) -> Self {
         CSRF {
             header_name: HeaderName::from_str(&header_name).unwrap(),
@@ -27,23 +41,14 @@ impl CSRF {
     }
 
     pub fn generate_token(&self) -> String {
-        let now = chrono::Utc::now().timestamp_millis().to_le_bytes();
-        let mut src = vec![0; 8+self.salt.len()];
-        src[0..8].copy_from_slice(&now);
-        src[8..].copy_from_slice(self.salt.as_bytes());
-        
-        let hash = sha2::Sha256::digest(&src);
-        let mut dst = vec![0; 8 + hash.len()];
-        dst[0..8].copy_from_slice(&now);
-        dst[8..].copy_from_slice(&hash);
-        hex::encode(hash)
+        CSRF::token(&self.salt)
     }
 
     pub fn verify_token(&self, test_token: &str) -> bool {
         let test_token = hex::decode(test_token);
 
         if let Ok(test_token) = test_token {
-            if test_token.len() != 80 {
+            if test_token.len() != 40 {
                 return false;
             }
             
@@ -54,8 +59,8 @@ impl CSRF {
 
             let generate_time = i64::from_le_bytes(generate_time.unwrap());
 
-            let now = chrono::Utc::now().timestamp_millis();
-            if now <= generate_time {
+            let now = chrono::Utc::now().timestamp_millis();            
+            if now < generate_time {
                 return false
             }
 
@@ -78,7 +83,7 @@ impl CSRF {
     
 }
 
-impl Handler for CSRF {
+impl Handler<BoxBody> for CSRF {
     fn skip(&self, req: &ServiceRequest) -> bool {
         let test_path = req.path();
         for url in &self.skip_urls {
@@ -134,8 +139,8 @@ mod tests {
     
     use sha2::Digest;
 
-    #[cfg(feature = "csrf")]
     #[test]
+    #[cfg(feature = "csrf")]
     fn test_hash() {
         let salt = "test".to_string();
         let now_src = chrono::Utc::now().timestamp_millis();
@@ -181,5 +186,20 @@ mod tests {
 
         //chrono::Duration::milliseconds(milliseconds)
         
+    }
+
+    #[test]
+    #[cfg(feature = "csrf")]
+    fn test_token() {
+        let csrf = super::CSRF::new(
+            "x-token",
+            vec![],
+            "cyberon",
+            chrono::Duration::seconds(3600),
+        );
+
+        let token = csrf.generate_token();
+        println!("{}", csrf.verify_token(&token));
+
     }
 }
